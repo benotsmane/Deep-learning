@@ -1,0 +1,116 @@
+import torch
+from torch.utils.tensorboard import SummaryWriter
+from sklearn.datasets import load_boston
+import matplotlib.pyplot as plt
+
+
+writer = SummaryWriter()
+
+#Getting boston data
+datax, datay = load_boston(return_X_y=True)
+datax = torch.tensor(datax,dtype=torch.float)
+datay = torch.tensor(datay,dtype=torch.float).reshape(-1,1)
+
+
+
+#split data
+idx = torch.randperm(len(datax))
+x_train, x_test = torch.split(datax, int(len(idx)*0.8))
+y_train, y_test = torch.split(datay, int(len(idx)*0.8))
+
+
+def normalize_data(train, test):
+    mean = torch.mean(train, 0, True)
+    std = torch.std(train, 0, True)
+    norm_train = (train - mean) / std
+    norm_test = (test - mean) / std
+
+    return norm_train, norm_test
+
+
+
+#Init param
+
+def mini_batch_NN(epsilon=0.01, epoch=1000, batch_size=32, norm_data=True):
+    
+    #normalisation des data
+    if(norm_data):
+        train, test = normalize_data(x_train, x_test)
+    
+
+    #Réseaux NN
+    model = torch.nn.Sequential(
+        torch.nn.Linear(x_train.shape[1],1),
+        torch.nn.Tanh(),
+        torch.nn.Linear(1, y_train.shape[1]))
+
+    loss_fonc = torch.nn.MSELoss(reduction='sum')
+    optim = torch.optim.SGD(model.parameters(), lr=epsilon)
+    #optim
+    #optim =....SGD(parameters=list(linear1.parameters()) + list(linear2.parameters())
+    
+    rec_loss_train = [None]*epoch
+    rec_loss_test = [None]*epoch
+    rand_ind = torch.randperm(len(train))
+    nb_batch = len(x_train)//batch_size +1
+      
+    for n_iter in range(epoch):
+        cumul_loss = 0
+        for ind_batch in range(nb_batch):
+            
+            batch_x = train[rand_ind[ind_batch*batch_size:(ind_batch+1)*batch_size]]
+        
+            y_hat = model(batch_x)
+
+            loss = loss_fonc(y_hat, y_train[rand_ind[ind_batch*batch_size:(ind_batch+1)*batch_size]])
+
+            ##  TODO:  Calcul du backward (grad_w, grad_b)
+            loss.backward()
+        
+            ##  TODO:  Mise à jour des paramètres du modèle
+            optim.step()
+
+            ## Reinitialisation du gradient
+            optim.zero_grad()
+            
+            cumul_loss += loss
+
+        #`loss` doit correspondre au coût MSE calculé à cette itération
+        # on peut visualiser avec
+        # tensorboard --logdir runs/
+        writer.add_scalar('Loss/train', cumul_loss, n_iter)
+            
+        # Sortie directe
+        print(f"Itérations {n_iter}: loss {cumul_loss}")
+        rec_loss_train[n_iter]= cumul_loss
+
+        #Evalute loss in test
+        with torch.no_grad():
+            y_hat_test = model(test)
+            loss_test = loss_fonc(y_hat_test, y_test)
+            writer.add_scalar('Loss/test', loss_test, n_iter)
+            rec_loss_test[n_iter]=loss_test
+
+    return rec_loss_train, rec_loss_test
+
+
+
+
+def plot(data, name_fig=""):
+    #plt.yscale('log')
+    plt.plot(data) 
+    plt.xlabel('epoch')
+
+    plt.ylabel('loss')
+
+ 
+    #plt.hist(tabNb)
+    #plt.savefig(name_fig)
+    plt.show()
+    #plt.clear()
+    
+
+loss_train, loss_test = mini_batch_NN(epsilon=1e-6, epoch=1000)
+
+plot(loss_train, name_fig='batch_loss_train')
+plot(loss_test, name_fig='batch_loss_test')

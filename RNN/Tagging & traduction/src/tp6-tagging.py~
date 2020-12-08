@@ -1,0 +1,381 @@
+import itertools
+import logging
+from tqdm import tqdm
+from pathlib import Path
+from datamaestro import prepare_dataset
+from torch.utils.data import Dataset, DataLoader
+from torch.nn.utils.rnn import pad_sequence
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.tensorboard import SummaryWriter
+import torch
+from typing import List
+import time
+import datetime
+import matplotlib.pyplot as plt
+from torch.distributions.bernoulli import Bernoulli
+
+logging.basicConfig(level=logging.INFO)
+
+ds = prepare_dataset('org.universaldependencies.french.gsd')
+#  TODO:  Implémenter maskedCrossEntropy
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+savepath = Path("LSTM_tagging_OVV.pch")
+# Tensorboard : rappel, lancer dans une console tensorboard --logdir runs
+writer = SummaryWriter("runs_tagging/runs"+datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
+
+class State:
+    def __init__(self, model, optim ):
+        self.model = model
+        self.optim = optim
+        self.epoch = 0
+        self.iteration = 0
+
+
+# Format de sortie décrit dans
+# https://pypi.org/project/conllu/
+
+class Vocabulary:
+    """Permet de gérer un vocabulaire.
+
+    En test, il est possible qu'un mot ne soit pas dans le
+    vocabulaire : dans ce cas le token "__OOV__" est utilisé.
+    Attention : il faut tenir compte de cela lors de l'apprentissage !
+
+    Utilisation:
+
+    - en train, utiliser v.get("blah", adding=True) pour que le mot soit ajouté
+      automatiquement
+    - en test, utiliser v["blah"] pour récupérer l'ID du mot (ou l'ID de OOV)
+    """
+    OOVID = 1
+    PAD = 0
+
+    def __init__(self, oov: bool):
+        self.oov =  oov
+        self.id2word = [ "PAD"]
+        self.word2id = { "PAD" : Vocabulary.PAD}
+        if oov:
+            self.word2id["__OOV__"] = Vocabulary.OOVID
+            self.id2word.append("__OOV__")
+
+    def __getitem__(self, word: str):
+        if self.oov:
+            return self.word2id.get(word, Vocabulary.OOVID)
+        return self.word2id[word]
+
+    def get(self, word: str, adding=True):
+        try:
+            return self.word2id[word]
+        except KeyError:
+            if adding:
+                wordid = len(self.id2word)
+                self.word2id[word] = wordid
+                self.id2word.append(word)
+                return wordid
+            if self.oov:
+                return Vocabulary.OOVID
+            raise
+
+    def __len__(self):
+        return len(self.id2word)
+
+    def getword(self,idx: int):
+        if idx < len(self):
+            return self.id2word[idx]
+        return None
+
+    def getwords(self,idx: List[int]):
+        return [self.getword(i) for i in idx]
+
+
+
+class TaggingDataset():
+    def __init__(self, data, words: Vocabulary, tags: Vocabulary, adding=True):
+        self.sentences = []
+
+        for s in data:
+            self.sentences.append(([words.get(token["form"], adding) for token in s], [tags.get(token["upostag"], adding) for token in s]))
+    def __len__(self):
+        return len(self.sentences)
+    def __getitem__(self, ix):
+        return self.sentences[ix]
+
+
+def collate(batch):
+    """Collate using pad_sequence"""
+    return tuple(pad_sequence([torch.LongTensor(b[j]) for b in batch]) for j in range(2))
+
+
+
+def get_token_accuracy(targets, outputs, ignore_index=None):
+    """ Get the accuracy token accuracy between two tensors.
+    """
+
+    n_correct = 0.0
+    n_total = 0.0
+    for target, output in zip(targets, outputs):
+        prediction = output
+        
+        if ignore_index is not None:
+            mask = target.ne(ignore_index)
+            n_correct += prediction.eq(target).masked_select(mask).sum().item()
+            n_total += mask.sum().item()
+        else:
+            n_total += len(target)
+            n_correct += prediction.eq(target).sum().item()
+
+    return n_correct / n_total, n_correct, n_total
+
+
+
+#  TODO:  Implémentez le modèle et la boucle d'apprentissage
+class LSTM(nn.Module):
+    #  TODO:  Implémenter un LSTM
+    def __init__(self, dim_input, dim_output, dim_latent, vocab_size):
+        super(LSTM, self).__init__()
+
+        self.embedding = nn.Embedding(vocab_size, dim_input)
+        self.lstm = nn.LSTM(dim_input, dim_latent)
+        self.hidden_2_out = nn.Linear(dim_latent, dim_output)
+        self.dim_input = dim_input
+        self.dim_output = dim_output
+        self.dim_latent = dim_latent
+    
+
+
+    def forward(self, X):
+        X_emb = self.embedding(X.long())
+        H , _ = self.lstm(X_emb)
+        
+        return H
+
+
+    def decode(self, h):
+        D = self.hidden_2_out(h)
+
+        return D
+
+    
+    def predict(self, X):
+        if len(X.shape) < 2 :
+            X = X.unsqueeze(1)
+
+        H = self.forward(X)
+        D = self.decode(H)
+        proba = torch.tensor(nn.functional.softmax(D, dim=2))
+        label = torch.argmax(proba, dim=2)
+
+        return label
+
+
+
+
+class GradientDescent(object):
+
+    def __init__(self, model, eps, epoch):
+        self.model = model
+        self.eps = eps
+        self.epoch = epoch
+        
+
+    def descente_gradient(self, loader_train, loader_test, pad_idx=0):
+
+        #parametre à optimiser
+        optim = torch.optim.Adam(self.model.parameters(), lr=self.eps)
+
+        #scheduler
+        lr_sched = torch.optim.lr_scheduler.ExponentialLR(optim, gamma=0.95)
+
+        criterion = nn.CrossEntropyLoss(ignore_index=pad_idx, reduction='sum')
+        #checkpoint
+        if savepath.is_file():
+            with savepath.open("rb") as fp:
+                state = torch.load(fp)
+
+        else:
+            state = State(self.model, optim)
+
+        rec_loss_train = [None]*epoch   #record train loss
+        rec_loss_test = [None]*epoch
+        rec_accuracy_train = [None]*epoch
+        rec_accuracy_test = [None]*epoch
+
+        #probability to inject a unknown word
+        proba_OVV = Bernoulli(torch.tensor([0.2]))
+        
+        for n_iter in range(state.epoch, self.epoch):
+            cumul_loss = 0
+            count_batch = 0
+            accuracy=0
+            for batch in loader_train:
+                #Reinitialisation du gradient
+                state.optim.zero_grad()
+
+                # unknown words injection
+                OVV = proba_OVV.sample(sample_shape=batch[0].shape).squeeze()
+                X_data = batch[0].clone()
+                
+                X_data[OVV==1]=1
+                X_data[batch[0]==0] = 0
+                
+                H = state.model.forward(X_data.to(device))
+
+                pred = state.model.decode(H)
+                target = batch[1].to(device)
+                
+                loss = criterion(pred.permute(0,2,1), target)
+                loss.backward()
+                
+                #Mise à jour paramétres du modéle
+                state.optim.step()
+                state.iteration +=1
+
+                #vidage GPU
+                H.cpu()
+                X_data.cpu()
+                target.cpu()
+                pred.cpu()
+
+                cumul_loss +=loss / len(batch[0])
+                #Accuracy
+                soft_m = torch.tensor(nn.functional.softmax(pred, dim=2))
+                label = torch.argmax(soft_m, dim=2)
+                accu_tmp, _, _ = get_token_accuracy(target, label, ignore_index=0)
+                
+                accuracy += accu_tmp
+                count_batch +=1
+
+
+        
+            with savepath.open("wb") as fp:
+                state.epoch = state.epoch + 1
+                torch.save(state, fp)
+            
+            # on peut visualiser avec
+            # tensorboard --logdir runs/
+            writer.add_scalar('Loss/train', cumul_loss, n_iter)
+            writer.add_scalar('accuracy/train', accuracy /count_batch, n_iter)
+
+            # Sortie directe
+            print(f"Itérations {n_iter}: loss/train {cumul_loss}")
+            rec_loss_train[n_iter]= cumul_loss
+            rec_accuracy_train[n_iter] = accuracy /count_batch
+
+            #Evalute loss in test
+            with torch.no_grad():
+                cumul_loss = 0
+                accuracy=0
+                count_batch=0
+                for batch in loader_test:
+
+                    H = state.model.forward(batch[0].to(device))
+
+                    pred = state.model.decode(H)
+                    target = batch[1].to(device)
+                    loss = criterion(pred.permute(0,2,1), target)
+
+                    #vidage GPU
+                    H.cpu()
+                    batch[0].cpu()
+                    pred.cpu()
+                    target.cpu()
+                    
+                    cumul_loss +=loss / len(batch[0])
+
+                    #Accuracy
+                    soft_m = torch.tensor(nn.functional.softmax(pred, dim=2))
+                    label = torch.argmax(soft_m, dim=2)
+                    #Number of words by batch
+                    accu_tmp, _, _ = get_token_accuracy(target, label, ignore_index=0)
+                    accuracy += accu_tmp
+                    count_batch +=1
+
+
+            
+            rec_loss_test[n_iter]= cumul_loss
+            rec_accuracy_test[n_iter] = accuracy /count_batch
+            # Sortie directe
+            print(f"Itérations {n_iter}: loss/test {cumul_loss}")
+            print(f"Itérations {n_iter}: ACCU/test {accuracy/count_batch}")
+            writer.add_scalar('Loss/test', cumul_loss, n_iter)
+            writer.add_scalar('accuracy/test', accuracy /count_batch, n_iter)
+
+            lr_sched.step()
+        
+        return (rec_loss_train, rec_loss_test), (rec_accuracy_train, rec_accuracy_test)
+            
+
+def plot(data, name_fig=""):
+    #plt.yscale('log')
+    plt.plot(data) 
+    plt.xlabel('epoch')
+
+    plt.ylabel('loss')
+
+ 
+    #plt.hist(tabNb)
+    #plt.savefig(name_fig)
+    plt.show()
+    #plt.clear()
+
+
+if __name__=="__main__":
+
+    logging.info("Loading datasets...")
+    words = Vocabulary(True)
+    tags = Vocabulary(False)
+    train_data = TaggingDataset(ds.train, words, tags, True)
+    dev_data = TaggingDataset(ds.validation, words, tags, True)
+    test_data = TaggingDataset(ds.test, words, tags, False)
+
+
+    logging.info("Vocabulary size: %d", len(words))
+
+
+    BATCH_SIZE=256
+    eps=1e-3
+    epoch=50
+    dim_latent=100
+    dim_input= 1000
+    dim_output= len(tags)
+    vocab_size= len(words)
+
+    train_loader = DataLoader(train_data, collate_fn=collate, batch_size=BATCH_SIZE, shuffle=True)
+    dev_loader = DataLoader(dev_data, collate_fn=collate, batch_size=BATCH_SIZE)
+    test_loader = DataLoader(test_data, collate_fn=collate, batch_size=BATCH_SIZE)
+
+    
+    model = LSTM(dim_input, dim_output, dim_latent, vocab_size)
+    model = model.to(device)
+    optimizer = GradientDescent(model, eps, epoch)
+    
+    loss, accuracy = optimizer.descente_gradient(train_loader, test_loader, pad_idx=0)
+
+
+    model.cpu()
+
+    plot(loss[0])
+    plot(loss[1])
+    plot(accuracy[0])
+    plot(accuracy[1])
+
+    #Generation
+    with savepath.open("rb") as fp:
+        state = torch.load(fp)
+
+    for batch in test_loader:
+        inputs = batch[0].to(device)
+        outputs = state.model.predict(inputs)
+        targets = batch[1]
+
+        inputs.cpu()
+        break
+
+    for idx in range(20): #torch.randint(inputs.shape[0],(5,)):
+        sequence = inputs[:, idx]
+        sequence = sequence[sequence > 0]
+        print('Sequence:\n', " ".join(words.getwords(sequence)))
+        print('Targets:\n', " ".join(tags.getwords(targets[:len(sequence),idx])))
+        print('Outputs:\n', " ".join(tags.getwords(outputs[:len(sequence),idx])))

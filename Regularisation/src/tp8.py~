@@ -1,0 +1,322 @@
+import logging
+logging.basicConfig(level=logging.INFO)
+
+import os
+from pathlib import Path
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
+import click
+from torch.utils.data import Subset
+import matplotlib.pyplot as plt
+import numpy as np
+import time
+
+from datamaestro import prepare_dataset
+
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+savepath = Path("../../../../../../../../tempory/Mnist_NN.pch")
+
+#writer = SummaryWriter("runs/runs"+time.asctime())
+
+# Ratio du jeu de train à utiliser
+TRAIN_RATIO = 0.05
+
+def store_grad(var):
+    """Stores the gradient during backward
+
+    For a tensor x, call `store_grad(x)`
+    before `loss.backward`. The gradient will be available
+    as `x.grad`
+
+    """
+    def hook(grad):
+        var.grad = grad
+    var.register_hook(hook)
+    return var
+
+
+class MonDataset(Dataset):
+    def __init__(self, X, Y):
+        self.X = torch.flatten(torch.tensor(X/255), start_dim=1).type(torch.FloatTensor)  #On normalise nos images entre 0 et 1 par le max couleur
+        
+        self.Y = Y
+
+
+    def __getitem__(self, index):
+        return self.X[index], self.Y[index]
+
+
+    def __len__(self):
+        return len(self.X)
+    
+
+
+
+class State:
+    def __init__(self, model, optim ):
+        self.model = model
+        self.optim = optim
+        self.epoch = 0
+        self.iteration = 0
+
+        
+
+class NN(nn.Module):
+    """
+    Cette classe contient la structure du réseau de neurones
+    """
+
+    def __init__(self, dim_input, dim_output, dim_hidden, ratio_dropout=0, norm=None):
+        super(NN, self).__init__()
+
+        self.layer1 = nn.Linear(dim_input, dim_hidden)
+        self.layer2 = nn.Linear(dim_hidden, dim_hidden)
+        self.layer3 = nn.Linear(dim_hidden, dim_hidden)
+        self.layer_out = nn.Linear(dim_hidden, dim_output)
+        self.norm = norm
+    
+        if norm=='batch':
+            self.batchNorm1 = nn.BatchNorm1d(dim_hidden)
+            self.batchNorm2 = nn.BatchNorm1d(dim_hidden)
+            self.batchNorm3 = nn.BatchNorm1d(dim_hidden)
+
+        elif norm=='layer':
+            self.layerNorm1 = nn.LayerNorm(dim_hidden)
+            self.layerNorm2 = nn.LayerNorm(dim_hidden)
+            self.layerNorm3 = nn.LayerNorm(dim_hidden)
+
+        self.dropout = nn.Dropout(p=ratio_dropout)
+        self.activ = nn.ReLU()
+        
+
+    def forward(self, X):
+        output = self.activ(self.layer1(X))
+        if self.norm == 'batch':
+            output = self.batchNorm1(output)
+
+        elif self.norm == 'layer':
+            output = self.layerNorm1(output)
+        output = self.dropout(output)
+        
+        output = self.activ(self.layer2(output))
+        if self.norm == 'batch':
+            output = self.batchNorm2(output)
+
+        elif self.norm == 'layer':
+            output = self.layerNorm2(output)
+        output = self.dropout(output)
+
+        output = self.activ(self.layer3(output))
+        if self.norm == 'batch':
+            output = self.batchNorm3(output)
+
+        elif self.norm == 'layer':
+            output = self.layerNorm3(output)
+        output = self.dropout(output)
+
+        output = self.layer_out(output)
+
+        return output
+
+    
+
+
+class GradientDescent(object):
+
+    def __init__(self, model, eps, epoch):
+        self.model = model
+        self.eps = eps
+        self.epoch = epoch
+        
+
+    def descente_gradient(self, loader_train, loader_test, lambda1=0, lambda2=0):
+
+        #parametre à optimiser
+        optim = torch.optim.Adam(self.model.parameters(), lr=self.eps)
+
+        #scheduler
+        #lr_sched = torch.optim.lr_scheduler.ExponentialLR(optim, gamma=0.99)
+
+        criterion = nn.CrossEntropyLoss()
+        #checkpoint
+        
+        if savepath.is_file():
+            with savepath.open("rb") as fp:
+                state = torch.load(fp)
+
+        else:
+            state = State(self.model, optim)
+
+
+
+        rec_loss_train = [None]*epoch   #record train loss
+        rec_loss_test = [None]*epoch
+        rec_accuracy_train = [None]*epoch
+        rec_accuracy_test = [None]*epoch
+
+        for n_iter in range(state.epoch, self.epoch):
+            model.train()
+            cumul_loss = 0
+            count_batch = 0
+            accuracy=0
+            
+            for batch in loader_train:
+                #Reinitialisation du gradient
+                state.optim.zero_grad()
+                
+                outputs = state.model.forward(batch[0].to(device))
+                target = batch[1].long().to(device)
+
+                loss = criterion(outputs, target)
+
+                #L1 Regularisation
+                #l1_penalty = torch.nn.L1Loss(size_average=False)
+                add_loss = 0
+                if lambda1 != 0:
+                    for param in state.model.parameters():
+                        add_loss += torch.norm(param, 1)
+                    
+                    loss += add_loss * lambda1
+
+                add_loss = 0
+                if lambda2 != 0:
+                    for param in state.model.parameters():
+                        add_loss += torch.norm(param, 2)**2
+                    
+                    loss += add_loss * lambda2
+                    
+                    
+                loss.backward()
+                
+                #Mise à jour paramétres du modéle
+                state.optim.step()
+                state.iteration +=1
+
+                #vidage GPU
+                batch[0].cpu()
+                target.cpu()
+                outputs.cpu()
+
+                cumul_loss += loss
+                #Accuracy
+                soft_m = torch.tensor(nn.functional.softmax(outputs, dim=1))
+                label = torch.argmax(soft_m, dim=1)
+                accuracy += (label==target.long()).sum().item() / len(target)
+
+                count_batch +=1
+
+        
+            with savepath.open("wb") as fp:
+                state.epoch = state.epoch + 1
+                torch.save(state, fp)
+            
+            # on peut visualiser avec
+            # tensorboard --logdir runs/
+            #writer.add_scalar('Loss/train', cumul_loss, n_iter)
+            #writer.add_scalar('accuracy/train', accuracy /count_batch, n_iter)
+
+            # Sortie directe
+            print(f"Itérations {n_iter}: loss/train {cumul_loss}")
+            print(f"Itérations {n_iter}: ACCU/train {accuracy/count_batch}")
+            rec_loss_train[n_iter]= cumul_loss
+            rec_accuracy_train[n_iter] = accuracy /count_batch
+
+            #Evalute loss in test
+            with torch.no_grad():
+                model.eval()
+                cumul_loss = 0
+                accuracy=0
+                count_batch=0
+                for batch in loader_test:
+                    outputs = state.model.forward(batch[0].to(device))
+                    target = batch[1].long().to(device)
+    
+                    loss = criterion(outputs, target)
+                    
+
+                    #vidage GPU
+                    batch[0].cpu()
+                    outputs.cpu()
+                    target.cpu()
+                    
+                    cumul_loss += loss
+
+                    #Accuracy
+                    soft_m = torch.tensor(nn.functional.softmax(outputs, dim=1))
+                    label = torch.argmax(soft_m, dim=1)
+                    accuracy += (label==target.long()).sum().item() / len(target)
+                    count_batch +=1
+
+
+            
+            rec_loss_test[n_iter]= cumul_loss
+            rec_accuracy_test[n_iter] = accuracy /count_batch
+            # Sortie directe
+            print(f"Itérations {n_iter}: loss/test {cumul_loss}")
+            print(f"Itérations {n_iter}: ACCU/test {accuracy/count_batch}")
+            #writer.add_scalar('Loss/test', cumul_loss, n_iter)
+            #writer.add_scalar('accuracy/test', accuracy /count_batch, n_iter)
+
+            #lr_sched.step()
+        
+        return (rec_loss_train, rec_loss_test), (rec_accuracy_train, rec_accuracy_test)
+
+
+
+def plot(data, name_fig=""):
+    #plt.yscale('log')
+    plt.plot(data) 
+    plt.xlabel('epoch')
+
+    plt.ylabel('loss')
+    plt.show()
+
+    
+
+if __name__=="__main__":
+    #Parameters
+    eps=1e-3
+    epoch=50
+    BATCH_SIZE=300
+    dim_input=28*28
+    dim_hidden_layer= 100
+    dim_output=10
+    
+    
+    ds = prepare_dataset("com.lecun.mnist")
+    train_img, train_labels = ds.train.images.data(), ds.train.labels.data()
+    test_img, test_labels = ds.test.images.data(), ds.test.labels.data()
+
+    train_dataset = MonDataset(train_img, train_labels)
+    test_dataset = MonDataset(test_img, test_labels)
+
+    train_size = len(train_dataset)
+    
+    indices = torch.randperm(train_size)  
+    train_subset = Subset(train_dataset, indices[:int(TRAIN_RATIO*train_size)])
+    val_subset = Subset(train_dataset, indices[int(TRAIN_RATIO*train_size):])
+    
+    train_loader = DataLoader(train_subset, batch_size=BATCH_SIZE, shuffle=True)
+    val_loader = DataLoader(val_subset , batch_size=BATCH_SIZE, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+
+    model = NN(dim_input, dim_output, dim_hidden_layer, ratio_dropout=0, norm='layer')
+    model = model.to(device)
+    optimizer = GradientDescent(model, eps, epoch)
+    
+    loss, accuracy = optimizer.descente_gradient(train_loader, val_loader, lambda1=0, lambda2=0)
+
+    model.cpu()
+    """
+    plot(loss[0])
+    plot(loss[1])
+    plot(accuracy[0])
+    plot(accuracy[1])
+    
+    """

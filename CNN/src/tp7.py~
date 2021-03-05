@@ -1,0 +1,295 @@
+import logging
+logging.basicConfig(level=logging.INFO)
+
+import heapq
+from pathlib import Path
+import gzip
+
+from tqdm import tqdm
+import time
+import torch
+import torch.nn as nn
+from torch.utils.tensorboard import SummaryWriter
+import sentencepiece as spm
+import matplotlib.pyplot as plt
+
+from tp7_preprocess import TextDataset
+
+# Utiliser tp7_preprocess pour générer le vocabulaire BPE et
+# le jeu de donnée dans un format compact
+
+# --- Configuration
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+savepath = Path("../../../../../../../../tempory/CNN.pch")
+
+writer = SummaryWriter("runs/runs"+time.asctime())
+
+
+# Taille du vocabulaire
+vocab_size = 1000
+MAINDIR = Path(__file__).parent
+
+# Chargement du tokenizer
+
+tokenizer = spm.SentencePieceProcessor()
+tokenizer.Load(f"wp{vocab_size}.model")
+ntokens = len(tokenizer)
+
+def loaddata(mode):
+    with gzip.open(f"{mode}-{vocab_size}.pth", "rb") as fp:
+        return torch.load(fp)
+
+
+
+class State:
+    def __init__(self, model, optim ):
+        self.model = model
+        self.optim = optim
+        self.epoch = 0
+        self.iteration = 0
+
+        
+
+class CNN(nn.Module):
+    """
+    Cette classe contient la structure du réseau de neurones
+    """
+
+    def __init__(self, dim_input, dim_output, dim_hidden=100, vocab_size=1000, nb_conv=1, nb_feat_map = 64, kernel_size=3, stride=1):
+        super(CNN, self).__init__()
+        # On défini d'abord les couches de convolution et de pooling comme un
+        # groupe de couches `self.features`
+
+        self.embedding = nn.Embedding(vocab_size, dim_input)
+        
+        self.conv_layers = nn.Sequential()
+
+        for i in range(nb_conv):
+            if i==0:
+                self.conv_layers.add_module("conv"+str(i), nn.Conv1d(in_channels=dim_input, out_channels=nb_feat_map, kernel_size=kernel_size, stride=stride))
+            else:
+                self.conv_layers.add_module("conv"+str(i), nn.Conv1d(in_channels=nb_feat_map, out_channels=nb_feat_map, kernel_size=kernel_size, stride=stride))
+            
+            self.conv_layers.add_module("relu"+str(i), nn.ReLU())
+            if i < nb_conv -1:
+                self.conv_layers.add_module("max_pool"+str(i), nn.MaxPool1d(kernel_size=kernel_size, stride=stride))
+                              
+        self.fully_connected = nn.Linear(nb_feat_map, dim_hidden)
+        self.activ = nn.ReLU()
+        self.output_layer = nn.Linear(dim_hidden, dim_output)
+
+
+
+    # méthode appelée quand on applique le réseau à un batch d'input
+    def forward(self, X):
+        X_emb = self.embedding(X.long())
+        output = self.conv_layers(X_emb.permute(0, 2, 1))
+        output = torch.max(output, 2)[0]
+        output = self.fully_connected(output)
+        output = self.activ(output)
+        output = self.output_layer(output)
+        return output
+
+
+
+
+
+class GradientDescent(object):
+
+    def __init__(self, model, eps, epoch):
+        self.model = model
+        self.eps = eps
+        self.epoch = epoch
+        
+
+    def descente_gradient(self, loader_train, loader_test):
+
+        #parametre à optimiser
+        optim = torch.optim.Adam(self.model.parameters(), lr=self.eps)
+
+        #scheduler
+        #lr_sched = torch.optim.lr_scheduler.ExponentialLR(optim, gamma=0.99)
+
+        criterion = nn.CrossEntropyLoss()
+        #checkpoint
+        
+        if savepath.is_file():
+            with savepath.open("rb") as fp:
+                state = torch.load(fp)
+
+        else:
+            state = State(self.model, optim)
+
+
+
+        rec_loss_train = [None]*epoch   #record train loss
+        rec_loss_test = [None]*epoch
+        rec_accuracy_train = [None]*epoch
+        rec_accuracy_test = [None]*epoch
+
+        for n_iter in range(state.epoch, self.epoch):
+            cumul_loss = 0
+            count_batch = 0
+            accuracy=0
+            
+            for batch in loader_train:
+                #Reinitialisation du gradient
+                state.optim.zero_grad()
+                
+                outputs = state.model.forward(batch[0].to(device))
+                target = batch[1].to(device)
+    
+                loss = criterion(outputs, target)
+                loss.backward()
+                
+                #Mise à jour paramétres du modéle
+                state.optim.step()
+                state.iteration +=1
+
+                #vidage GPU
+                batch[0].cpu()
+                target.cpu()
+                outputs.cpu()
+
+                cumul_loss += loss
+                #Accuracy
+                soft_m = torch.tensor(nn.functional.softmax(outputs, dim=1))
+                label = torch.argmax(soft_m, dim=1)
+                accuracy += (label==target.long()).sum().item() / len(target)
+
+                count_batch +=1
+
+        
+            with savepath.open("wb") as fp:
+                state.epoch = state.epoch + 1
+                torch.save(state, fp)
+            
+            # on peut visualiser avec
+            # tensorboard --logdir runs/
+            writer.add_scalar('Loss/train', cumul_loss, n_iter)
+            writer.add_scalar('accuracy/train', accuracy /count_batch, n_iter)
+
+            # Sortie directe
+            print(f"Itérations {n_iter}: loss/train {cumul_loss}")
+            print(f"Itérations {n_iter}: ACCU/train {accuracy/count_batch}")
+            rec_loss_train[n_iter]= cumul_loss
+            rec_accuracy_train[n_iter] = accuracy /count_batch
+
+            #Evalute loss in test
+            with torch.no_grad():
+                cumul_loss = 0
+                accuracy=0
+                count_batch=0
+                for batch in loader_test:
+                    outputs = state.model.forward(batch[0].to(device))
+                    target = batch[1].to(device)
+    
+                    loss = criterion(outputs, target)
+                    
+
+                    #vidage GPU
+                    batch[0].cpu()
+                    outputs.cpu()
+                    target.cpu()
+                    
+                    cumul_loss += loss
+
+                    #Accuracy
+                    soft_m = torch.tensor(nn.functional.softmax(outputs, dim=1))
+                    label = torch.argmax(soft_m, dim=1)
+                    accuracy += (label==target.long()).sum().item() / len(target)
+                    count_batch +=1
+
+
+            
+            rec_loss_test[n_iter]= cumul_loss
+            rec_accuracy_test[n_iter] = accuracy /count_batch
+            # Sortie directe
+            print(f"Itérations {n_iter}: loss/test {cumul_loss}")
+            print(f"Itérations {n_iter}: ACCU/test {accuracy/count_batch}")
+            writer.add_scalar('Loss/test', cumul_loss, n_iter)
+            writer.add_scalar('accuracy/test', accuracy /count_batch, n_iter)
+
+            #lr_sched.step()
+        
+        return (rec_loss_train, rec_loss_test), (rec_accuracy_train, rec_accuracy_test)
+            
+
+def plot(data, name_fig=""):
+    #plt.yscale('log')
+    plt.plot(data) 
+    plt.xlabel('epoch')
+
+    plt.ylabel('loss')
+
+
+    
+
+if __name__=="__main__":
+
+    test = loaddata("test")
+    train = loaddata("train")
+    TRAIN_BATCHSIZE=1000
+    TEST_BATCHSIZE=1000
+
+
+    # --- Chargements des jeux de données train, validation et test
+
+    val_size = 1000
+    train_size = len(train) - val_size
+    train, val = torch.utils.data.random_split(train, [train_size, val_size])
+    
+    logging.info("Datasets: train=%d, val=%d, test=%d", train_size, val_size, len(test))
+    logging.info("Vocabulary size: %d", vocab_size)
+    train_iter = torch.utils.data.DataLoader(train, batch_size=TRAIN_BATCHSIZE, collate_fn=TextDataset.collate)
+    val_iter = torch.utils.data.DataLoader(val, batch_size=TEST_BATCHSIZE, collate_fn=TextDataset.collate)
+    test_iter = torch.utils.data.DataLoader(test, batch_size=TEST_BATCHSIZE, collate_fn=TextDataset.collate)
+
+
+
+    #Parameters
+    eps=1e-3
+    epoch=10
+    dim_input=1000
+    dim_hidden_layer= 100
+    dim_output=3
+    nb_conv_layer=2
+    nb_feature_map=100
+    kernel_size=3
+    stride=1
+    
+    model = CNN(dim_input, dim_output, dim_hidden=dim_hidden_layer, vocab_size=vocab_size, nb_conv=nb_conv_layer, nb_feat_map = nb_feature_map, kernel_size=kernel_size, stride=stride)
+    model = model.to(device)
+    optimizer = GradientDescent(model, eps, epoch)
+    
+    loss, accuracy = optimizer.descente_gradient(train_iter, val_iter)
+
+    model.cpu()
+    
+    plot(loss[0])
+    plot(loss[1])
+    plot(accuracy[0])
+    plot(accuracy[1])
+
+    for i in range(3):
+        accuracy = 0
+        count_batch=0
+        for batch in train_iter:
+            target = batch[1]
+            accuracy += (i==target.long()).sum().item() / len(target)
+            count_batch +=1
+
+        print("accuracy train classe "+str(i)+": ", accuracy/count_batch)
+
+        
+    for i in range(3):
+        accuracy = 0
+        count_batch =0
+        for batch in val_iter:
+            target = batch[1]
+            accuracy += (i==target.long()).sum().item() / len(target)
+            count_batch +=1
+
+        print("accuracy test classe "+str(i)+": ", accuracy/count_batch)
